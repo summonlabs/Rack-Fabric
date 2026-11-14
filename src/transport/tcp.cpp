@@ -158,7 +158,14 @@ bool TcpConnection::receive(Frame& frame, const ResourceLimits& limits,
     return false;
   }
   const NativeSocket socket = to_native(handle_.load());
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  // The timeout bounds the wait for a frame to start. Once a frame has
+  // started, it bounds the silence between its pieces instead: a frame that
+  // keeps arriving is never cut off by the caller's poll interval, which would
+  // leave its remaining bytes to be read as the start of the next frame.
+  auto deadline = std::chrono::steady_clock::now() + timeout;
+  const auto expired = [](std::size_t received_bytes) {
+    return received_bytes == 0 ? "receive timed out" : "receive stalled mid-frame";
+  };
 
   std::vector<std::byte> buffer(kFrameHeaderBytes);
   std::size_t received = 0;
@@ -166,12 +173,12 @@ bool TcpConnection::receive(Frame& frame, const ResourceLimits& limits,
     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
         deadline - std::chrono::steady_clock::now());
     if (remaining.count() <= 0) {
-      error = "receive timed out";
+      error = expired(received);
       return false;
     }
     const int ready = wait_socket(socket, false, remaining);
     if (ready == 0) {
-      error = "receive timed out";
+      error = expired(received);
       return false;
     }
     if (ready < 0) {
@@ -189,6 +196,7 @@ bool TcpConnection::receive(Frame& frame, const ResourceLimits& limits,
       return false;
     }
     received += static_cast<std::size_t>(read);
+    deadline = std::chrono::steady_clock::now() + timeout;
   }
 
   // The header is validated before the declared payload length is trusted.
@@ -219,12 +227,12 @@ bool TcpConnection::receive(Frame& frame, const ResourceLimits& limits,
     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
         deadline - std::chrono::steady_clock::now());
     if (remaining.count() <= 0) {
-      error = "receive timed out";
+      error = expired(received);
       return false;
     }
     const int ready = wait_socket(socket, false, remaining);
     if (ready == 0) {
-      error = "receive timed out";
+      error = expired(received);
       return false;
     }
     if (ready < 0) {
@@ -242,6 +250,7 @@ bool TcpConnection::receive(Frame& frame, const ResourceLimits& limits,
       return false;
     }
     received += static_cast<std::size_t>(read);
+    deadline = std::chrono::steady_clock::now() + timeout;
   }
 
   const DecodeResult decoded = decode_frame(buffer.data(), buffer.size(), limits);

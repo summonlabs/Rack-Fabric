@@ -19,6 +19,7 @@
 #include <shared_mutex>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "core/canonical.hpp"
@@ -34,6 +35,14 @@ constexpr std::int64_t kMaxTtlMillis = 86'400'000LL;  // 24 hours
 
 [[nodiscard]] bool ttl_is_valid(std::chrono::milliseconds ttl) noexcept {
   return ttl.count() >= 0 && ttl.count() <= kMaxTtlMillis;
+}
+
+/// True when the publisher has not heartbeated within its lease. The same
+/// rule the expiry sweep applies: authority ends with the lease, not with the
+/// sweep that later fences the incarnation.
+[[nodiscard]] bool lease_expired(const PublisherRecord& publisher, Timestamp now) noexcept {
+  return publisher.lease_millis > 0 && publisher.last_seen_at.known() && now.known() &&
+         now.millis() - publisher.last_seen_at.millis() > publisher.lease_millis;
 }
 
 [[nodiscard]] std::optional<std::string> validate_evidence(
@@ -81,6 +90,32 @@ constexpr std::int64_t kMaxTtlMillis = 86'400'000LL;  // 24 hours
   return validate_evidence(quantity.provenance, quantity.observed_at, quantity.ttl, quantity.durability);
 }
 
+[[nodiscard]] std::optional<std::string> validate_detail_quantity(
+    const std::optional<Quantity>& quantity) {
+  if (!quantity.has_value()) {
+    return std::nullopt;
+  }
+  return validate_quantity(*quantity, quantity->unit);
+}
+
+/// Member details carry evidence and identities like any other part of a
+/// record; they are held to the same validity as the record itself.
+[[nodiscard]] std::optional<std::string> validate_details(const MemberDetails& details) {
+  if (const auto* node = std::get_if<NodeDetails>(&details)) {
+    if ((node->worker.has_value() && !validate_identity(node->worker->value()).ok()) ||
+        (node->boot.has_value() && !validate_identity(node->boot->value()).ok())) {
+      return "INVALID_DETAIL_IDENTITY";
+    }
+  } else if (const auto* memory = std::get_if<MemoryDomainDetails>(&details)) {
+    return validate_detail_quantity(memory->bandwidth);
+  } else if (const auto* nic = std::get_if<NicDetails>(&details)) {
+    return validate_detail_quantity(nic->link_speed);
+  } else if (const auto* network_switch = std::get_if<SwitchDetails>(&details)) {
+    return validate_detail_quantity(network_switch->link_speed);
+  }
+  return std::nullopt;
+}
+
 [[nodiscard]] std::optional<std::string> validate_member_record(const MemberRecord& record,
                                                                const ResourceLimits& limits) {
   if (!validate_identity(record.key.id).ok()) {
@@ -107,12 +142,17 @@ constexpr std::int64_t kMaxTtlMillis = 86'400'000LL;  // 24 hours
       record.provenance == EvidenceProvenance::Unknown) {
     return "PRESENT_WITHOUT_EVIDENCE";
   }
+  // Absent evidence still carries a lifetime, and the persisted format refuses
+  // a lifetime outside the bound, so it is checked whether or not evidence is
+  // present.
   if (record.health.has_evidence()) {
     if (const auto error = validate_evidence(record.health.provenance, record.health.observed_at,
                                              record.health.ttl, record.health.durability);
         error.has_value()) {
       return error;
     }
+  } else if (!ttl_is_valid(record.health.ttl)) {
+    return "TTL_OUT_OF_RANGE";
   }
   if (record.readiness.has_evidence()) {
     if (const auto error = validate_evidence(record.readiness.provenance, record.readiness.observed_at,
@@ -120,6 +160,8 @@ constexpr std::int64_t kMaxTtlMillis = 86'400'000LL;  // 24 hours
         error.has_value()) {
       return error;
     }
+  } else if (!ttl_is_valid(record.readiness.ttl)) {
+    return "TTL_OUT_OF_RANGE";
   }
   if (record.reachability.has_evidence()) {
     if (const auto error =
@@ -128,6 +170,11 @@ constexpr std::int64_t kMaxTtlMillis = 86'400'000LL;  // 24 hours
         error.has_value()) {
       return error;
     }
+  } else if (!ttl_is_valid(record.reachability.ttl)) {
+    return "TTL_OUT_OF_RANGE";
+  }
+  if (const auto error = validate_details(record.details); error.has_value()) {
+    return error;
   }
   for (const auto& capability : record.capabilities) {
     if (!validate_identity(capability.id.value()).ok()) {
@@ -217,6 +264,16 @@ constexpr std::int64_t kMaxTtlMillis = 86'400'000LL;  // 24 hours
 
 [[nodiscard]] MutationResult unchanged(const RackState& state, std::string code, std::string subject) {
   return make_result(state, MutationOutcome::NoChange, std::move(code), std::move(subject), {});
+}
+
+[[nodiscard]] MutationResult stale_member_generation(const RackState& state, const MemberKey& key,
+                                                     MemberGeneration expected,
+                                                     MemberGeneration current) {
+  return rejected(state, MutationOutcome::RejectStaleGeneration, "STALE_MEMBER_GENERATION",
+                  key.to_string(),
+                  {generation_factor("STALE_MEMBER_GENERATION",
+                                     "the expected member generation is older than the current one",
+                                     "member_generation", expected.value(), current.value())});
 }
 
 struct AuthorityCheck {
@@ -342,7 +399,15 @@ struct AuthorityCheck {
       return check;
     }
   }
-  (void)now;
+  if (lease_expired(publisher->second, now)) {
+    check.outcome = MutationOutcome::RejectStaleWorkerBoot;
+    check.code = "PUBLISHER_LEASE_EXPIRED";
+    check.subject = token.boot->value();
+    check.factors.push_back(factor("PUBLISHER_LEASE_EXPIRED",
+                                   "the publisher did not heartbeat within its lease; its authority "
+                                   "has ended"));
+    return check;
+  }
   check.publisher = &publisher->second;
   return check;
 }
@@ -378,12 +443,24 @@ void apply_owner(RackState& state, MemberRecord& record, const AuthorityToken& t
   }
 }
 
-[[nodiscard]] bool owner_conflict(const std::optional<AgentBootId>& existing,
+/// A record belongs to the incarnation that published it, and no other
+/// incarnation may change it while that owner is current. Once the owner has
+/// been fenced or lost the record has no live owner: the next incarnation that
+/// publishes it re-asserts it, exactly as after recovery, where every record
+/// loses its dead owner. Otherwise a dead process would pin its records as
+/// unrepublishable for the rest of the epoch.
+[[nodiscard]] bool owner_conflict(const RackState& state, const std::optional<AgentBootId>& existing,
                                   const AuthorityToken& token) {
-  if (!token.boot.has_value() || !existing.has_value()) {
+  if (!token.boot.has_value() || !existing.has_value() || *existing == *token.boot) {
     return false;
   }
-  return !(*existing == *token.boot);
+  if (state.fenced_boots.find(*existing) != state.fenced_boots.end()) {
+    return false;
+  }
+  const auto owner = state.publishers.find(*existing);
+  return owner != state.publishers.end() &&
+         (owner->second.state == PublisherState::Registered ||
+          owner->second.state == PublisherState::Active);
 }
 
 void fence_member_evidence(MemberRecord& record, RevalidationReason reason) {
@@ -408,6 +485,7 @@ void fence_member_evidence(MemberRecord& record, RevalidationReason reason) {
       capability.revalidation_required = true;
     }
   }
+  demote_ephemeral_observations(record, false);
 }
 
 }  // namespace
@@ -507,11 +585,22 @@ MutationResult RackFabric::register_publisher(const RegisterPublisherRequest& re
                     {factor("BOOT_FENCED",
                             "the boot identity has been fenced and can never reacquire authority")});
   }
-  if (state.publishers.size() >= impl_->options.limits.max_connections &&
-      state.publishers.find(*request.boot) == state.publishers.end()) {
-    return rejected(state, MutationOutcome::RejectLimitExceeded, "PUBLISHER_LIMIT_EXCEEDED",
-                    request.boot->value(),
-                    {factor("PUBLISHER_LIMIT_EXCEEDED", "the publisher limit has been reached")});
+  const std::size_t max_connections = impl_->options.limits.max_connections;
+  if (state.publishers.find(*request.boot) == state.publishers.end()) {
+    // The connection limit bounds live incarnations. Fenced and lost ones are
+    // history and never use up a registration slot.
+    std::size_t current = 0;
+    for (const auto& [boot, publisher] : state.publishers) {
+      (void)boot;
+      if (publisher.state == PublisherState::Registered || publisher.state == PublisherState::Active) {
+        ++current;
+      }
+    }
+    if (current >= max_connections) {
+      return rejected(state, MutationOutcome::RejectLimitExceeded, "PUBLISHER_LIMIT_EXCEEDED",
+                      request.boot->value(),
+                      {factor("PUBLISHER_LIMIT_EXCEEDED", "the publisher limit has been reached")});
+    }
   }
   const auto existing = state.publishers.find(*request.boot);
   if (existing != state.publishers.end()) {
@@ -529,14 +618,53 @@ MutationResult RackFabric::register_publisher(const RegisterPublisherRequest& re
                       {factor("WORKER_IDENTITY_CHANGED",
                               "the boot identity is already registered for a different worker")});
     }
-    existing->second.last_seen_at = now;
-    existing->second.state = PublisherState::Active;
+    // Registering an incarnation that is already registered changes nothing:
+    // it is not a heartbeat, so it neither renews the lease nor revives an
+    // incarnation whose lease has run out.
+    if (lease_expired(existing->second, now)) {
+      return rejected(state, MutationOutcome::RejectStaleWorkerBoot, "PUBLISHER_LEASE_EXPIRED",
+                      request.boot->value(),
+                      {factor("PUBLISHER_LEASE_EXPIRED",
+                              "the publisher did not heartbeat within its lease; its authority "
+                              "has ended")});
+    }
     return unchanged(state, "PUBLISHER_ALREADY_REGISTERED", request.boot->value());
   }
   if (request.label.has_value() && !validate_label(*request.label).ok()) {
     return rejected(state, MutationOutcome::RejectInvalidInput, "INVALID_LABEL",
                     request.boot->value(),
                     {factor("INVALID_LABEL", "the publisher label is not a valid bounded label")});
+  }
+
+  // The history of dead incarnations is bounded by the same bound persisted
+  // state is decoded with, so the state always reloads. The longest-silent
+  // dead incarnation is forgotten first; its boot identity stays refused
+  // through the fenced set.
+  const std::size_t history_limit = max_connections * 16U;
+  while (state.publishers.size() >= history_limit) {
+    auto oldest = state.publishers.end();
+    for (auto it = state.publishers.begin(); it != state.publishers.end(); ++it) {
+      if (it->second.state == PublisherState::Registered ||
+          it->second.state == PublisherState::Active) {
+        continue;
+      }
+      if (oldest == state.publishers.end() ||
+          it->second.last_seen_at.millis() < oldest->second.last_seen_at.millis()) {
+        oldest = it;
+      }
+    }
+    if (oldest == state.publishers.end()) {
+      break;
+    }
+    if (state.fenced_boots.find(oldest->first) == state.fenced_boots.end()) {
+      FencedBootRecord fenced{oldest->first};
+      fenced.worker = oldest->second.worker;
+      fenced.fenced_under_epoch = state.generations.coordinator_epoch;
+      fenced.fenced_at = now;
+      fenced.reason = RevalidationReason::OwnerProcessLost;
+      state.fenced_boots.insert_or_assign(oldest->first, std::move(fenced));
+    }
+    state.publishers.erase(oldest);
   }
 
   PublisherRecord publisher{*request.worker, *request.boot};
@@ -684,7 +812,7 @@ MutationResult RackFabric::publish_member(const PublishMemberRequest& request) {
                       record.key.to_string(),
                       {factor("MEMBER_RETIRED", "a retired identity cannot be resurrected")});
     }
-    if (owner_conflict(existing.owner_boot, request.authority)) {
+    if (owner_conflict(state, existing.owner_boot, request.authority)) {
       note_rejection(check.publisher);
       return rejected(state, MutationOutcome::RejectNotAuthorized, "MEMBER_OWNED_BY_OTHER_PROCESS",
                       record.key.to_string(),
@@ -889,6 +1017,12 @@ MutationResult RackFabric::publish_relationship(const PublishRelationshipRequest
     return rejected(state, MutationOutcome::RejectInvalidInput, *error, record.key.to_string(),
                     {factor(*error, "the relationship evidence is not structurally valid")});
   }
+  if (record.link.has_value() && !validate_identity(record.link->value()).ok()) {
+    note_rejection(check.publisher);
+    return rejected(state, MutationOutcome::RejectInvalidInput, "INVALID_LINK_IDENTITY",
+                    record.key.to_string(),
+                    {factor("INVALID_LINK_IDENTITY", "the relationship link identity is invalid")});
+  }
   if (record.capacity.has_value()) {
     if (const auto error = validate_quantity(*record.capacity, record.capacity->unit); error.has_value()) {
       note_rejection(check.publisher);
@@ -925,7 +1059,7 @@ MutationResult RackFabric::publish_relationship(const PublishRelationshipRequest
   const auto existing_it = state.relationships.find(record.key);
   if (existing_it != state.relationships.end()) {
     const RelationshipRecord& existing = existing_it->second;
-    if (owner_conflict(existing.owner_boot, request.authority)) {
+    if (owner_conflict(state, existing.owner_boot, request.authority)) {
       note_rejection(check.publisher);
       return rejected(state, MutationOutcome::RejectNotAuthorized, "RELATIONSHIP_OWNED_BY_OTHER_PROCESS",
                       record.key.to_string(),
@@ -1052,7 +1186,7 @@ MutationResult RackFabric::publish_failure_domain(const PublishFailureDomainRequ
       return rejected(state, MutationOutcome::RejectRetired, "FAILURE_DOMAIN_RETIRED", record.id.value(),
                       {factor("FAILURE_DOMAIN_RETIRED", "a retired failure domain cannot be resurrected")});
     }
-    if (owner_conflict(existing.owner_boot, request.authority)) {
+    if (owner_conflict(state, existing.owner_boot, request.authority)) {
       note_rejection(check.publisher);
       return rejected(state, MutationOutcome::RejectNotAuthorized,
                       "FAILURE_DOMAIN_OWNED_BY_OTHER_PROCESS", record.id.value(),
@@ -1149,6 +1283,35 @@ MutationResult RackFabric::publish_power_envelope(const PublishPowerEnvelopeRequ
       return rejected(state, MutationOutcome::RejectInvalidInput, *error, "power_envelope",
                       {factor(*error, "the observed rack draw is not structurally valid")});
     }
+  }
+  // Domain budgets are held to the same validity as the rack-level values.
+  for (const auto& budget : record.domain_budgets) {
+    if (!validate_identity(budget.domain.value()).ok()) {
+      note_rejection(check.publisher);
+      return rejected(state, MutationOutcome::RejectInvalidInput, "INVALID_POWER_DOMAIN_IDENTITY",
+                      "power_envelope",
+                      {factor("INVALID_POWER_DOMAIN_IDENTITY",
+                              "a power domain budget names an invalid power domain")});
+    }
+    std::optional<std::string> error;
+    if (budget.limit.has_value()) {
+      error = validate_quantity(*budget.limit, QuantityUnit::Watts);
+    }
+    if (!error.has_value() && budget.observed_draw.has_value()) {
+      error = validate_quantity(*budget.observed_draw, budget.observed_draw->unit);
+    }
+    if (error.has_value()) {
+      note_rejection(check.publisher);
+      return rejected(state, MutationOutcome::RejectInvalidInput, *error, budget.domain.value(),
+                      {factor(*error, "a power domain budget is not structurally valid")});
+    }
+  }
+  if (state.power.has_value() && owner_conflict(state, state.power->owner_boot, request.authority)) {
+    note_rejection(check.publisher);
+    return rejected(state, MutationOutcome::RejectNotAuthorized, "POWER_ENVELOPE_OWNED_BY_OTHER_PROCESS",
+                    "power_envelope",
+                    {factor("POWER_ENVELOPE_OWNED_BY_OTHER_PROCESS",
+                            "the power envelope is owned by a different process incarnation")});
   }
   if (state.power.has_value() && request.expected_generation.has_value() &&
       *request.expected_generation < state.generations.power) {
@@ -1266,6 +1429,14 @@ MutationResult RackFabric::publish_cooling_envelope(const PublishCoolingEnvelope
   }
   std::sort(record.zones.begin(), record.zones.end(),
             [](const CoolingZoneRecord& lhs, const CoolingZoneRecord& rhs) { return lhs.zone < rhs.zone; });
+  if (state.cooling.has_value() &&
+      owner_conflict(state, state.cooling->owner_boot, request.authority)) {
+    note_rejection(check.publisher);
+    return rejected(state, MutationOutcome::RejectNotAuthorized,
+                    "COOLING_ENVELOPE_OWNED_BY_OTHER_PROCESS", "cooling_envelope",
+                    {factor("COOLING_ENVELOPE_OWNED_BY_OTHER_PROCESS",
+                            "the cooling envelope is owned by a different process incarnation")});
+  }
   if (state.cooling.has_value() && request.expected_generation.has_value() &&
       *request.expected_generation < state.generations.cooling) {
     note_rejection(check.publisher);
@@ -1336,7 +1507,7 @@ MutationResult RackFabric::publish_health(const PublishHealthRequest& request) {
                     request.member.to_string(),
                     {factor("UNKNOWN_MEMBER", "the member does not exist in the current rack")});
   }
-  if (owner_conflict(existing->second.owner_boot, request.authority)) {
+  if (owner_conflict(state, existing->second.owner_boot, request.authority)) {
     note_rejection(check.publisher);
     return rejected(state, MutationOutcome::RejectNotAuthorized, "MEMBER_OWNED_BY_OTHER_PROCESS",
                     request.member.to_string(),
@@ -1420,7 +1591,7 @@ MutationResult RackFabric::publish_capability(const PublishCapabilityRequest& re
                     request.member.to_string(),
                     {factor("UNKNOWN_MEMBER", "the member does not exist in the current rack")});
   }
-  if (owner_conflict(existing->second.owner_boot, request.authority)) {
+  if (owner_conflict(state, existing->second.owner_boot, request.authority)) {
     note_rejection(check.publisher);
     return rejected(state, MutationOutcome::RejectNotAuthorized, "MEMBER_OWNED_BY_OTHER_PROCESS",
                     request.member.to_string(),
@@ -1519,12 +1690,25 @@ MutationResult RackFabric::withdraw_evidence(const WithdrawEvidenceRequest& requ
                     request.member.to_string(),
                     {factor("UNKNOWN_MEMBER", "the member does not exist in the current rack")});
   }
-  if (owner_conflict(existing->second.owner_boot, request.authority)) {
+  if (owner_conflict(state, existing->second.owner_boot, request.authority)) {
     note_rejection(check.publisher);
     return rejected(state, MutationOutcome::RejectNotAuthorized, "MEMBER_OWNED_BY_OTHER_PROCESS",
                     request.member.to_string(),
                     {factor("MEMBER_OWNED_BY_OTHER_PROCESS",
                             "the member is owned by a different process incarnation")});
+  }
+  if (existing->second.lifecycle == MemberLifecycle::Retired) {
+    // A retired identity is history: withdrawing its evidence would hand it a
+    // live lifecycle again.
+    note_rejection(check.publisher);
+    return rejected(state, MutationOutcome::RejectRetired, "MEMBER_RETIRED", request.member.to_string(),
+                    {factor("MEMBER_RETIRED", "a retired identity cannot be resurrected")});
+  }
+  if (request.expected_generation.has_value() &&
+      *request.expected_generation < existing->second.generation) {
+    note_rejection(check.publisher);
+    return stale_member_generation(state, request.member, *request.expected_generation,
+                                   existing->second.generation);
   }
   MemberRecord record = existing->second;
   const auto reset_evidence = [](auto& evidence) {
@@ -1599,12 +1783,22 @@ MutationResult RackFabric::withdraw_relationship(const WithdrawRelationshipReque
   if (existing == state.relationships.end()) {
     return unchanged(state, "RELATIONSHIP_ABSENT", key.to_string());
   }
-  if (owner_conflict(existing->second.owner_boot, request.authority)) {
+  if (owner_conflict(state, existing->second.owner_boot, request.authority)) {
     note_rejection(check.publisher);
     return rejected(state, MutationOutcome::RejectNotAuthorized, "RELATIONSHIP_OWNED_BY_OTHER_PROCESS",
                     key.to_string(),
                     {factor("RELATIONSHIP_OWNED_BY_OTHER_PROCESS",
                             "the relationship is owned by a different process incarnation")});
+  }
+  if (request.expected_generation.has_value() &&
+      *request.expected_generation < state.generations.topology) {
+    note_rejection(check.publisher);
+    return rejected(state, MutationOutcome::RejectStaleGeneration, "STALE_TOPOLOGY_GENERATION",
+                    key.to_string(),
+                    {generation_factor("STALE_TOPOLOGY_GENERATION",
+                                       "the expected topology generation is older than the current one",
+                                       "topology_generation", request.expected_generation->value(),
+                                       state.generations.topology.value())});
   }
   state.index_remove_relationship(existing->second);
   state.relationships.erase(existing);
@@ -1635,7 +1829,7 @@ MutationResult RackFabric::mark_unavailable(const MarkUnavailableRequest& reques
                     request.member.to_string(),
                     {factor("UNKNOWN_MEMBER", "the member does not exist in the current rack")});
   }
-  if (owner_conflict(existing->second.owner_boot, request.authority)) {
+  if (owner_conflict(state, existing->second.owner_boot, request.authority)) {
     note_rejection(check.publisher);
     return rejected(state, MutationOutcome::RejectNotAuthorized, "MEMBER_OWNED_BY_OTHER_PROCESS",
                     request.member.to_string(),
@@ -1646,6 +1840,12 @@ MutationResult RackFabric::mark_unavailable(const MarkUnavailableRequest& reques
     note_rejection(check.publisher);
     return rejected(state, MutationOutcome::RejectRetired, "MEMBER_RETIRED", request.member.to_string(),
                     {factor("MEMBER_RETIRED", "a retired member cannot be marked unavailable")});
+  }
+  if (request.expected_generation.has_value() &&
+      *request.expected_generation < existing->second.generation) {
+    note_rejection(check.publisher);
+    return stale_member_generation(state, request.member, *request.expected_generation,
+                                   existing->second.generation);
   }
   MemberRecord record = existing->second;
   if (record.lifecycle == MemberLifecycle::Unavailable) {
@@ -1692,8 +1892,21 @@ MutationResult RackFabric::retire_member(const RetireMemberRequest& request) {
                     request.member.to_string(),
                     {factor("UNKNOWN_MEMBER", "the member does not exist in the current rack")});
   }
+  if (owner_conflict(state, existing->second.owner_boot, request.authority)) {
+    note_rejection(check.publisher);
+    return rejected(state, MutationOutcome::RejectNotAuthorized, "MEMBER_OWNED_BY_OTHER_PROCESS",
+                    request.member.to_string(),
+                    {factor("MEMBER_OWNED_BY_OTHER_PROCESS",
+                            "the member is owned by a different process incarnation")});
+  }
   if (existing->second.lifecycle == MemberLifecycle::Retired) {
     return unchanged(state, "MEMBER_ALREADY_RETIRED", request.member.to_string());
+  }
+  if (request.expected_generation.has_value() &&
+      *request.expected_generation < existing->second.generation) {
+    note_rejection(check.publisher);
+    return stale_member_generation(state, request.member, *request.expected_generation,
+                                   existing->second.generation);
   }
   MemberRecord record = existing->second;
   record.lifecycle = MemberLifecycle::Retired;
@@ -1842,7 +2055,8 @@ MutationResult RackFabric::revalidate_members(const RevalidateMembersRequest& re
   if (targets.empty()) {
     return unchanged(state, "NOTHING_TO_REVALIDATE", "<none>");
   }
-  std::size_t revalidated = 0;
+  // Every target is checked before anything is written, so a rejected
+  // revalidation leaves canonical state untouched.
   for (const auto& key : targets) {
     const auto it = state.members.find(key);
     if (it == state.members.end()) {
@@ -1850,26 +2064,29 @@ MutationResult RackFabric::revalidate_members(const RevalidateMembersRequest& re
       return rejected(state, MutationOutcome::RejectUnknownMember, "UNKNOWN_MEMBER", key.to_string(),
                       {factor("UNKNOWN_MEMBER", "the member does not exist in the current rack")});
     }
-    if (owner_conflict(it->second.owner_boot, request.authority)) {
+    if (owner_conflict(state, it->second.owner_boot, request.authority)) {
       note_rejection(check.publisher);
       return rejected(state, MutationOutcome::RejectNotAuthorized, "MEMBER_OWNED_BY_OTHER_PROCESS",
                       key.to_string(),
                       {factor("MEMBER_OWNED_BY_OTHER_PROCESS",
                               "the member is owned by a different process incarnation")});
     }
+    if (it->second.revalidation_required && !it->second.generation.next().has_value()) {
+      note_rejection(check.publisher);
+      return rejected(state, MutationOutcome::RejectLimitExceeded, "GENERATION_EXHAUSTED", key.to_string(),
+                      {factor("GENERATION_EXHAUSTED", "member generation exhausted")});
+    }
+  }
+  std::size_t revalidated = 0;
+  for (const auto& key : targets) {
+    const auto it = state.members.find(key);
     if (!it->second.revalidation_required) {
       continue;
     }
     MemberRecord record = it->second;
     record.revalidation_required = false;
     record.revalidation_reason = RevalidationReason::None;
-    const auto next = record.generation.next();
-    if (!next.has_value()) {
-      note_rejection(check.publisher);
-      return rejected(state, MutationOutcome::RejectLimitExceeded, "GENERATION_EXHAUSTED", key.to_string(),
-                      {factor("GENERATION_EXHAUSTED", "member generation exhausted")});
-    }
-    record.generation = *next;
+    record.generation = *record.generation.next();
     state.index_remove_member(it->second);
     state.index_add_member(record);
     state.members.insert_or_assign(key, std::move(record));
@@ -1971,34 +2188,31 @@ MutationResult RackFabric::fence_publisher(const FencePublisherRequest& request)
     state.index_add_member(record);
     state.members.insert_or_assign(key, std::move(record));
   }
+  // Every record the fenced process owned must be revalidated, durable or
+  // not, and every live observation it supplied stops being current, however
+  // the record that carries it is classified.
   for (auto& [key, record] : state.relationships) {
     (void)key;
-    if (record.owner_boot.has_value() && *record.owner_boot == boot &&
-        record.durability == Durability::Ephemeral) {
+    if (record.owner_boot.has_value() && *record.owner_boot == boot) {
       record.revalidation_required = true;
+      demote_ephemeral_observations(record, false);
     }
   }
   for (auto& [key, record] : state.failure_domains) {
     (void)key;
-    if (record.owner_boot.has_value() && *record.owner_boot == boot &&
-        record.durability == Durability::Ephemeral) {
+    if (record.owner_boot.has_value() && *record.owner_boot == boot) {
       record.revalidation_required = true;
     }
   }
-  if (state.power.has_value() && state.power->durability == Durability::Ephemeral &&
-      state.power->owner_boot.has_value() && *state.power->owner_boot == boot) {
+  if (state.power.has_value() && state.power->owner_boot.has_value() &&
+      *state.power->owner_boot == boot) {
     state.power->revalidation_required = true;
-    state.power->rack_observed_draw.reset();
-    state.power->rack_headroom.reset();
+    clear_live_observations(*state.power);
   }
-  if (state.cooling.has_value() && state.cooling->durability == Durability::Ephemeral &&
-      state.cooling->owner_boot.has_value() && *state.cooling->owner_boot == boot) {
+  if (state.cooling.has_value() && state.cooling->owner_boot.has_value() &&
+      *state.cooling->owner_boot == boot) {
     state.cooling->revalidation_required = true;
-    for (auto& zone : state.cooling->zones) {
-      zone.observed_temperature.reset();
-      zone.thermal_headroom.reset();
-      zone.throttling.reset();
-    }
+    clear_live_observations(*state.cooling);
   }
   const auto membership_next = state.generations.membership.is_unset()
                                    ? std::optional<MembershipGeneration>(MembershipGeneration::first())
@@ -2496,10 +2710,15 @@ SnapshotResult RackFabric::publish_snapshot(const SnapshotRequest& request) {
   }
   RackSnapshot snapshot = state.build_snapshot(*snapshot_id, *next_generation, publication, now);
   state.snapshot_generation = *next_generation;
-  if (state.snapshots.size() >= impl_->options.limits.max_retained_snapshots) {
+  // Retention is bounded: the oldest snapshots are dropped first, and a bound
+  // of zero retains none.
+  const std::size_t retention = impl_->options.limits.max_retained_snapshots;
+  while (!state.snapshots.empty() && state.snapshots.size() >= retention) {
     state.snapshots.erase(state.snapshots.begin());
   }
-  state.snapshots.insert_or_assign(*next_generation, snapshot);
+  if (retention > 0) {
+    state.snapshots.insert_or_assign(*next_generation, snapshot);
+  }
   advance_publication(state, check.publisher);
   out.result = accepted(state, "SNAPSHOT_PUBLISHED", snapshot_id->value());
   out.snapshot = std::move(snapshot);

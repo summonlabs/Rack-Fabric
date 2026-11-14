@@ -17,7 +17,8 @@ set(RACK_FABRIC_TEST_SOURCES
   test_recovery.cpp
   test_concurrency.cpp
   test_property.cpp
-  test_synthetic.cpp)
+  test_synthetic.cpp
+  test_regression.cpp)
 
 add_executable(rack_fabric_tests ${RACK_FABRIC_TEST_SOURCES})
 target_include_directories(rack_fabric_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

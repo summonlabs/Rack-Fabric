@@ -139,25 +139,24 @@ int main(int argc, char** argv) {
   coordinator_options.rack_label = options.rack_label;
   coordinator_options.persistence_path = options.state_path;
   coordinator_options.persist_after_mutation = options.persist;
+  // Recovery runs inside start(), before the rack is declared and before any
+  // session is accepted.
+  coordinator_options.recover_state = true;
   if (!coordinator_options.rack.has_value() || !coordinator_options.rack_epoch.has_value()) {
     std::cerr << "the rack identity and rack epoch are not valid identities\n";
     return 2;
   }
 
+  std::error_code exists_error;
+  const bool recovering =
+      !options.state_path.empty() && std::filesystem::exists(options.state_path, exists_error);
   std::string error;
   auto server = rack_fabric::CoordinatorServer::start(coordinator_options, error);
   if (!server.has_value()) {
     std::cerr << "the coordinator could not start: " << error << "\n";
     return 1;
   }
-  if (options.state_path.empty()) {
-    // Nothing to recover.
-  } else if (std::filesystem::exists(options.state_path)) {
-    const rack_fabric::PersistenceResult loaded = (*server)->fabric().load_state(options.state_path);
-    if (loaded.status != rack_fabric::PersistenceStatus::Ok) {
-      std::cerr << "state recovery failed: " << loaded.explanation.render() << "\n";
-      return 1;
-    }
+  if (recovering) {
     std::cout << "recovered epoch=" << (*server)->epoch().value() << "\n";
   }
 
@@ -172,6 +171,9 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds{20});
   }
 
+  // Sessions are stopped before the final save, so no mutation can be
+  // accepted after the state that survives the restart was written.
+  (*server)->stop();
   if (!options.state_path.empty()) {
     const rack_fabric::PersistenceResult saved =
         (*server)->fabric().save_state(options.state_path);
@@ -179,7 +181,6 @@ int main(int argc, char** argv) {
       std::cerr << "final persistence failed: " << saved.explanation.render() << "\n";
     }
   }
-  (*server)->stop();
   std::cout << "stopped accepted=" << (*server)->accepted_mutations()
             << " rejected=" << (*server)->rejected_mutations()
             << " connections=" << (*server)->total_connections() << "\n";

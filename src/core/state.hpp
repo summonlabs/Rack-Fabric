@@ -117,6 +117,20 @@ struct RackState {
 /// restarts.
 [[nodiscard]] bool member_has_ephemeral_evidence(const MemberRecord& record) noexcept;
 
+/// A live observation nested in a record is governed by its own durability,
+/// whatever the durability of the record that carries it. These make every
+/// ephemeral observation nested in a record non-current: with clear the value
+/// is dropped (recovery), otherwise it is kept for diagnosis and flagged for
+/// revalidation (fencing).
+void demote_ephemeral_observations(MemberRecord& record, bool clear) noexcept;
+void demote_ephemeral_observations(RelationshipRecord& record, bool clear) noexcept;
+
+/// Drops every ephemeral value of an envelope, and every observed value when
+/// the envelope itself is ephemeral, together with the headroom derived from
+/// them. Declared durable limits are kept.
+void clear_live_observations(PowerEnvelopeRecord& record) noexcept;
+void clear_live_observations(CoolingEnvelopeRecord& record) noexcept;
+
 /// SHA-256 digest of the deterministic encoding of a snapshot's content.
 [[nodiscard]] std::string compute_snapshot_digest(const RackSnapshot& snapshot,
                                                   const ResourceLimits& limits);

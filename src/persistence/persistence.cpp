@@ -111,6 +111,7 @@ void apply_recovery_policy(RackState& state, CoordinatorEpoch epoch, Timestamp n
       record.revalidation_reason = RevalidationReason::CoordinatorRestarted;
     }
     clear_owner(record);
+    demote_ephemeral_observations(record, true);
     if (record.health.durability == Durability::Ephemeral) {
       record.health = EvidenceValue<HealthState>{};
     }
@@ -132,6 +133,7 @@ void apply_recovery_policy(RackState& state, CoordinatorEpoch epoch, Timestamp n
       record.revalidation_required = true;
     }
     clear_owner(record);
+    demote_ephemeral_observations(record, true);
   }
   for (auto& [key, record] : state.failure_domains) {
     (void)key;
@@ -145,14 +147,7 @@ void apply_recovery_policy(RackState& state, CoordinatorEpoch epoch, Timestamp n
       state.power->revalidation_required = true;
     }
     clear_owner(*state.power);
-    if (state.power->durability == Durability::Ephemeral) {
-      state.power->rack_observed_draw.reset();
-      state.power->rack_headroom.reset();
-      for (auto& budget : state.power->domain_budgets) {
-        budget.observed_draw.reset();
-        budget.headroom.reset();
-      }
-    }
+    clear_live_observations(*state.power);
   }
   if (state.cooling.has_value()) {
     if (state.cooling->durability == Durability::Ephemeral ||
@@ -160,13 +155,7 @@ void apply_recovery_policy(RackState& state, CoordinatorEpoch epoch, Timestamp n
       state.cooling->revalidation_required = true;
     }
     clear_owner(*state.cooling);
-    if (state.cooling->durability == Durability::Ephemeral) {
-      for (auto& zone : state.cooling->zones) {
-        zone.observed_temperature.reset();
-        zone.thermal_headroom.reset();
-        zone.throttling.reset();
-      }
-    }
+    clear_live_observations(*state.cooling);
   }
   state.generations.coordinator_epoch = epoch;
   state.rebuild_indexes();
@@ -305,6 +294,10 @@ PersistenceResult RackFabric::save_state(const std::filesystem::path& path,
   PersistenceResult result;
   result.path = path.string();
 
+  // Saves are serialized from the copy to the rename, so the file is always
+  // replaced in the order the copies were taken: an older copy can never be
+  // renamed over a newer one.
+  const std::lock_guard<std::mutex> serialized(impl_->save_mutex);
   RackState snapshot_state;
   {
     std::shared_lock<std::shared_mutex> lock(impl_->mutex);
@@ -324,7 +317,10 @@ PersistenceResult RackFabric::save_state(const std::filesystem::path& path,
   const std::vector<std::byte>& payload = *encoded;
   const std::uint64_t max_bytes =
       std::min<std::uint64_t>(options.max_bytes, impl_->options.limits.max_persisted_bytes);
-  if (payload.size() > max_bytes) {
+  // The bound applies to the file that a load reads back, header and trailer
+  // included, so a save can never produce a file that load refuses.
+  if (max_bytes < kHeaderBytes + kTrailerBytes ||
+      payload.size() > max_bytes - (kHeaderBytes + kTrailerBytes)) {
     return persistence_failure(PersistenceStatus::LimitExceeded, "PAYLOAD_TOO_LARGE",
                                "the encoded state exceeds the configured bound", result.path);
   }

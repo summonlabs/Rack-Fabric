@@ -90,9 +90,13 @@ struct Agent::Impl {
     return true;
   }
 
+  /// publication is false for a request that is not a publication (a
+  /// heartbeat): the coordinator does not advance the publication generation
+  /// for it, so neither may the agent.
   [[nodiscard]] bool send_and_expect_result(MessageType type,
                                             const std::vector<std::byte>& payload,
-                                            MutationResult& result, std::string& error) {
+                                            MutationResult& result, std::string& error,
+                                            bool publication = true) {
     Frame request;
     request.type = type;
     request.correlation = next_correlation();
@@ -127,7 +131,7 @@ struct Agent::Impl {
     result.explanation.code = message.code;
     result.explanation.ok = message.accepted;
     result.explanation.subject = message.detail;
-    if (message.accepted) {
+    if (message.accepted && publication) {
       const auto next = publication_generation.next();
       if (next.has_value()) {
         publication_generation = *next;
@@ -242,6 +246,9 @@ struct Agent::Impl {
       if (stopping.load(std::memory_order_acquire)) {
         break;
       }
+      // The token and publication generation are read under the same lock that
+      // publications update them under.
+      const std::lock_guard<std::mutex> guard(io_mutex);
       HeartbeatMessage message;
       message.authority = token();
       message.authority.publication_generation.reset();
@@ -252,8 +259,7 @@ struct Agent::Impl {
       }
       MutationResult result;
       std::string error;
-      const std::lock_guard<std::mutex> guard(io_mutex);
-      if (!send_and_expect_result(MessageType::Heartbeat, *payload, result, error)) {
+      if (!send_and_expect_result(MessageType::Heartbeat, *payload, result, error, false)) {
         set_error(error);
         connection.close();
         break;

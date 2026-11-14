@@ -5,7 +5,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <deque>
+#include <filesystem>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -19,15 +22,21 @@
 namespace rack_fabric {
 namespace {
 
-[[nodiscard]] ResultMessage to_result(const MutationResult& result) {
+[[nodiscard]] ResultMessage to_result(const MutationResult& result, const ResourceLimits& limits) {
   ResultMessage message;
   message.accepted = result.accepted();
   message.outcome = result.outcome;
   message.generations = result.generations_after;
   message.code = result.explanation.code;
   message.detail = result.explanation.render();
-  if (message.detail.size() > 4096) {
-    message.detail.resize(4096);
+  // Every protocol string is bounded. An explanation longer than the bound is
+  // truncated: a result that cannot be encoded would leave the request
+  // without any answer.
+  if (message.code.size() > limits.max_string_bytes) {
+    message.code.resize(limits.max_string_bytes);
+  }
+  if (message.detail.size() > limits.max_string_bytes) {
+    message.detail.resize(limits.max_string_bytes);
   }
   return message;
 }
@@ -115,8 +124,11 @@ struct CoordinatorServer::Impl {
   std::atomic<std::size_t> malformed_frames{0};
   std::thread accept_thread;
   mutable std::mutex mutex;
-  std::vector<std::thread> session_threads;
-  std::vector<std::shared_ptr<transport::TcpConnection>> session_connections;
+  std::uint64_t next_session = 0;
+  std::map<std::uint64_t, std::thread> session_threads;
+  std::map<std::uint64_t, std::shared_ptr<transport::TcpConnection>> session_connections;
+  /// Sessions whose thread has finished serving and can be joined.
+  std::vector<std::uint64_t> finished_sessions;
   std::deque<CoordinatorEvent> events;
 
   void record(const std::string& kind, const std::string& detail) {
@@ -161,7 +173,7 @@ struct CoordinatorServer::Impl {
 
   void reply_result(transport::TcpConnection& connection, MessageType type,
                     std::uint64_t correlation, const MutationResult& result) {
-    const ResultMessage message = to_result(result);
+    const ResultMessage message = to_result(result, options.limits);
     const auto payload = MessageCodec::encode(message, options.limits);
     if (!payload.has_value()) {
       record("encode_failed", "result message could not be encoded");
@@ -206,19 +218,21 @@ struct CoordinatorServer::Impl {
     return true;
   }
 
-  void handle_hello(transport::TcpConnection& connection, const Frame& frame) {
+  /// False when the handshake failed; the session then ends, so a peer that
+  /// does not speak this protocol can never register or mutate.
+  [[nodiscard]] bool handle_hello(transport::TcpConnection& connection, const Frame& frame) {
     HelloMessage hello;
     if (MessageCodec::decode(frame.payload.data(), frame.payload.size(), hello, options.limits) !=
         DecodeStatus::Ok) {
       malformed_frames.fetch_add(1, std::memory_order_relaxed);
       reply_error(connection, frame.correlation, ProtocolError::MalformedPayload,
                   "HELLO payload is malformed");
-      return;
+      return false;
     }
     if (hello.protocol_version != kProtocolVersion) {
       reply_error(connection, frame.correlation, ProtocolError::UnsupportedVersion,
                   "the agent speaks an unsupported protocol version");
-      return;
+      return false;
     }
     HelloAckMessage ack;
     ack.protocol_version = kProtocolVersion;
@@ -231,6 +245,7 @@ struct CoordinatorServer::Impl {
       reply(connection, MessageType::HelloAck, frame.correlation, *payload);
     }
     record("hello", hello.agent_version);
+    return true;
   }
 
   void handle_register(transport::TcpConnection& connection, const Frame& frame,
@@ -575,11 +590,15 @@ struct CoordinatorServer::Impl {
           reply_result(connection, MessageType::Result, frame.correlation, published.result);
           return;
         }
+        // A request has exactly one answer: the snapshot itself, or the
+        // result when the snapshot does not fit in one frame.
         const auto payload = MessageCodec::encode_snapshot_payload(*published.snapshot, options.limits);
-        if (payload.has_value()) {
-          reply(connection, MessageType::SnapshotResponse, frame.correlation, *payload);
+        if (!payload.has_value()) {
+          finish_mutation(connection, frame, published.result);
+          return;
         }
-        finish_mutation(connection, frame, published.result);
+        account_mutation(published.result);
+        reply(connection, MessageType::SnapshotResponse, frame.correlation, *payload);
         return;
       }
       default:
@@ -589,14 +608,18 @@ struct CoordinatorServer::Impl {
     }
   }
 
-  void finish_mutation(transport::TcpConnection& connection, const Frame& frame,
-                       const MutationResult& result) {
+  void account_mutation(const MutationResult& result) {
     if (result.accepted()) {
       accepted_mutations.fetch_add(1, std::memory_order_relaxed);
       persist_if_configured();
     } else {
       rejected_mutations.fetch_add(1, std::memory_order_relaxed);
     }
+  }
+
+  void finish_mutation(transport::TcpConnection& connection, const Frame& frame,
+                       const MutationResult& result) {
+    account_mutation(result);
     reply_result(connection, MessageType::Result, frame.correlation, result);
   }
 
@@ -624,29 +647,30 @@ struct CoordinatorServer::Impl {
     }
   }
 
-  void serve(std::shared_ptr<transport::TcpConnection> connection) {
+  void serve(std::shared_ptr<transport::TcpConnection> connection, std::uint64_t id) {
     std::optional<AgentBootId> session_boot;
     std::optional<WorkerId> session_worker;
     transport::TcpConnection& local = *connection;
-    const std::uintptr_t handle = local.handle();
 
     // A session must introduce itself first.
     Frame frame;
     std::string error;
     if (!local.receive(frame, options.limits, options.connect_timeout, error)) {
       record("session_rejected", error);
-      end_session(handle);
+      local.close();
+      end_session(id);
       return;
     }
     if (frame.type != MessageType::Hello) {
       reply_error(local, frame.correlation, ProtocolError::MalformedPayload,
                   "the first message on a session must be HELLO");
-      end_session(handle);
+      local.close();
+      end_session(id);
       return;
     }
-    handle_hello(local, frame);
+    bool serving = handle_hello(local, frame);
 
-    while (!stopping.load(std::memory_order_acquire)) {
+    while (serving && !stopping.load(std::memory_order_acquire)) {
       if (!local.receive(frame, options.limits, options.session_wait, error)) {
         if (stopping.load(std::memory_order_acquire)) {
           break;
@@ -664,7 +688,7 @@ struct CoordinatorServer::Impl {
       }
       switch (frame.type) {
         case MessageType::Hello:
-          handle_hello(local, frame);
+          serving = handle_hello(local, frame);
           break;
         case MessageType::Register:
           handle_register(local, frame, session_boot, session_worker);
@@ -700,37 +724,63 @@ struct CoordinatorServer::Impl {
       }
     }
     local.close();
-    end_session(handle);
+    end_session(id);
   }
 
-  void end_session(std::uintptr_t handle) {
+  // A session is identified by the id it was started with, never by its
+  // socket handle, which close() invalidates before the session ends.
+  void end_session(std::uint64_t id) {
     std::lock_guard<std::mutex> guard(mutex);
-    const auto found = std::find_if(
-        session_connections.begin(), session_connections.end(),
-        [handle](const std::shared_ptr<transport::TcpConnection>& connection) {
-          return connection->handle() == handle;
-        });
-    if (found != session_connections.end()) {
-      session_connections.erase(found);
-    }
+    session_connections.erase(id);
+    finished_sessions.push_back(id);
     if (open_connections.load(std::memory_order_relaxed) > 0) {
       open_connections.fetch_sub(1, std::memory_order_relaxed);
     }
   }
 
+  /// Joins the threads of sessions that have ended, so the coordinator only
+  /// ever holds threads for live sessions.
+  void reap_finished_sessions() {
+    std::vector<std::thread> finished;
+    {
+      std::lock_guard<std::mutex> guard(mutex);
+      for (const std::uint64_t id : finished_sessions) {
+        const auto found = session_threads.find(id);
+        if (found != session_threads.end()) {
+          finished.push_back(std::move(found->second));
+          session_threads.erase(found);
+        }
+      }
+      finished_sessions.clear();
+    }
+    for (auto& thread : finished) {
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+  }
+
   void accept_loop() {
+    auto last_sweep = std::chrono::steady_clock::now();
     while (!stopping.load(std::memory_order_acquire)) {
+      reap_finished_sessions();
       std::string error;
       std::optional<transport::TcpConnection> connection =
           listener.accept(options.accept_wait, error);
-      if (!connection.has_value()) {
-        // A publisher whose lease has expired is fenced here. Process death is
-        // therefore detected by the runtime instead of being assumed benign:
-        // the dead incarnation can never publish again, and the evidence it
-        // supplied stops counting as current.
+      // A publisher whose lease has expired is fenced here. Process death is
+      // therefore detected by the runtime instead of being assumed benign:
+      // the dead incarnation can never publish again, and the evidence it
+      // supplied stops counting as current. The sweep runs on a clock, not
+      // only when an accept wait runs out, so a steady stream of connections
+      // can never postpone it.
+      const auto now = std::chrono::steady_clock::now();
+      if (!connection.has_value() || now - last_sweep >= options.accept_wait) {
+        last_sweep = now;
         if (fabric.expire_publishers() > 0) {
           record("publishers_expired", "one or more publisher leases expired");
         }
+      }
+      if (!connection.has_value()) {
         continue;
       }
       if (open_connections.load(std::memory_order_relaxed) >= options.max_connections) {
@@ -742,8 +792,9 @@ struct CoordinatorServer::Impl {
       total_connections.fetch_add(1, std::memory_order_relaxed);
       auto shared = std::make_shared<transport::TcpConnection>(std::move(*connection));
       std::lock_guard<std::mutex> guard(mutex);
-      session_connections.push_back(shared);
-      session_threads.emplace_back([this, shared]() { serve(shared); });
+      const std::uint64_t id = ++next_session;
+      session_connections.emplace(id, shared);
+      session_threads.emplace(id, std::thread([this, shared, id]() { serve(shared, id); }));
     }
   }
 };
@@ -756,6 +807,18 @@ std::optional<std::unique_ptr<CoordinatorServer>> CoordinatorServer::start(
     return std::nullopt;
   }
   auto server = std::unique_ptr<CoordinatorServer>(new CoordinatorServer(options));
+  // Durable state is recovered before the coordinator declares the rack or
+  // accepts a single session: the recovered state owns the rack identity, and
+  // no mutation may be accepted, or persisted over the file, before recovery.
+  std::error_code exists_error;
+  if (options.recover_state && !options.persistence_path.empty() &&
+      std::filesystem::exists(options.persistence_path, exists_error)) {
+    const PersistenceResult loaded = server->impl_->fabric.load_state(options.persistence_path);
+    if (loaded.status != PersistenceStatus::Ok) {
+      error = "state recovery failed: " + loaded.explanation.render();
+      return std::nullopt;
+    }
+  }
   std::string bind_error;
   std::optional<transport::TcpListener> listener =
       transport::TcpListener::bind_loopback(options.port, 64, bind_error);
@@ -815,22 +878,27 @@ void CoordinatorServer::stop() {
   }
   const bool already_stopping = impl_->stopping.exchange(true, std::memory_order_acq_rel);
   impl_->listener.close();
-  std::vector<std::thread> threads;
-  std::vector<std::shared_ptr<transport::TcpConnection>> connections;
+  // The accept loop is stopped first, so no session can start after the
+  // session tables have been taken over below.
+  if (impl_->accept_thread.joinable()) {
+    impl_->accept_thread.join();
+  }
+  std::map<std::uint64_t, std::thread> threads;
+  std::map<std::uint64_t, std::shared_ptr<transport::TcpConnection>> connections;
   {
     std::lock_guard<std::mutex> guard(impl_->mutex);
     connections.swap(impl_->session_connections);
     threads.swap(impl_->session_threads);
+    impl_->finished_sessions.clear();
   }
   // Closing a socket unblocks a session thread that is waiting on it. close()
   // is idempotent and safe to call concurrently with a read or write.
-  for (auto& connection : connections) {
+  for (auto& [id, connection] : connections) {
+    (void)id;
     connection->close();
   }
-  if (impl_->accept_thread.joinable()) {
-    impl_->accept_thread.join();
-  }
-  for (auto& thread : threads) {
+  for (auto& [id, thread] : threads) {
+    (void)id;
     if (thread.joinable()) {
       thread.join();
     }

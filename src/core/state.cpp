@@ -5,9 +5,11 @@
 
 #include <algorithm>
 #include <deque>
+#include <limits>
 #include <set>
 #include <string>
 #include <utility>
+#include <variant>
 
 #include "core/canonical.hpp"
 #include "internal/crypto.hpp"
@@ -174,6 +176,67 @@ bool member_has_ephemeral_evidence(const MemberRecord& record) noexcept {
     }
   }
   return false;
+}
+
+namespace {
+
+void demote_quantity(std::optional<Quantity>& value, bool clear) noexcept {
+  if (!value.has_value() || value->durability != Durability::Ephemeral) {
+    return;
+  }
+  if (clear) {
+    value.reset();
+  } else {
+    value->revalidation_required = true;
+  }
+}
+
+void clear_quantity(std::optional<Quantity>& value, bool always) noexcept {
+  if (value.has_value() && (always || value->durability == Durability::Ephemeral)) {
+    value.reset();
+  }
+}
+
+}  // namespace
+
+void demote_ephemeral_observations(MemberRecord& record, bool clear) noexcept {
+  if (auto* memory = std::get_if<MemoryDomainDetails>(&record.details)) {
+    demote_quantity(memory->bandwidth, clear);
+  } else if (auto* nic = std::get_if<NicDetails>(&record.details)) {
+    demote_quantity(nic->link_speed, clear);
+  } else if (auto* network_switch = std::get_if<SwitchDetails>(&record.details)) {
+    demote_quantity(network_switch->link_speed, clear);
+  }
+}
+
+void demote_ephemeral_observations(RelationshipRecord& record, bool clear) noexcept {
+  demote_quantity(record.capacity, clear);
+}
+
+void clear_live_observations(PowerEnvelopeRecord& record) noexcept {
+  const bool all = record.durability == Durability::Ephemeral;
+  clear_quantity(record.rack_limit, false);
+  clear_quantity(record.rack_observed_draw, all);
+  clear_quantity(record.rack_headroom, all);
+  for (auto& budget : record.domain_budgets) {
+    clear_quantity(budget.limit, false);
+    clear_quantity(budget.observed_draw, all);
+    clear_quantity(budget.headroom, all);
+  }
+}
+
+void clear_live_observations(CoolingEnvelopeRecord& record) noexcept {
+  const bool all = record.durability == Durability::Ephemeral;
+  for (auto& zone : record.zones) {
+    clear_quantity(zone.design_thermal_limit, false);
+    clear_quantity(zone.cooling_capacity, false);
+    clear_quantity(zone.observed_temperature, all);
+    clear_quantity(zone.thermal_headroom, all);
+    if (zone.throttling.has_value() &&
+        (all || zone.throttling->durability == Durability::Ephemeral)) {
+      zone.throttling.reset();
+    }
+  }
 }
 
 void RackState::rebuild_indexes() {
@@ -724,7 +787,10 @@ RackSnapshot RackState::build_snapshot(const SnapshotId& id, SnapshotGeneration 
 }
 
 std::string compute_snapshot_digest(const RackSnapshot& snapshot, const ResourceLimits& limits) {
-  internal::ByteWriter writer(limits);
+  // The digest covers the whole deterministic encoding. It is not bounded by
+  // the frame payload limit: a writer that stops at that bound would leave
+  // every byte past it out of the digest.
+  internal::ByteWriter writer(limits, std::numeric_limits<std::size_t>::max());
   encode_snapshot(writer, snapshot);
   const auto& bytes = writer.bytes();
   return internal::Sha256::hash(bytes.data(), bytes.size());

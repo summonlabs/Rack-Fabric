@@ -44,6 +44,10 @@ struct CoordinatorOptions {
   /// When set, authoritative state is persisted after every accepted mutation.
   std::string persistence_path;
   bool persist_after_mutation = false;
+  /// When set, state is recovered from persistence_path (when the file
+  /// exists) inside start(), before the rack is declared and before any
+  /// session is accepted. A recovery failure fails start().
+  bool recover_state = false;
   /// Bounded waits so that shutdown is deterministic and no thread blocks
   /// indefinitely on a socket.
   std::chrono::milliseconds accept_wait{20};

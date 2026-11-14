@@ -7,6 +7,7 @@
 #ifndef RACK_FABRIC_INTERNAL_IMPL_HPP
 #define RACK_FABRIC_INTERNAL_IMPL_HPP
 
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 
@@ -25,6 +26,8 @@ class RackFabric::Impl {
   RackFabricOptions options;
   const Clock* clock = nullptr;
   mutable std::shared_mutex mutex;
+  /// Serializes save_state from the state copy to the file rename.
+  mutable std::mutex save_mutex;
   RackState state;
 };
 

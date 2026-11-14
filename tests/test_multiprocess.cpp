@@ -730,3 +730,41 @@ RF_TEST(multiprocess, many_concurrent_agent_sessions_are_served) {
   coordinator.release();
   remove_directory(directory);
 }
+
+RF_TEST(multiprocess, a_coordinator_recovers_its_state_before_it_serves) {
+  // The recovered state owns the rack identity: a coordinator asked to serve
+  // a different rack than the one it recovers must refuse to start, and it
+  // must never accept a session before recovery has run.
+  const std::string directory = make_directory("recover-first");
+  const std::string state_path = directory + "\\state.rkf";
+  {
+    RackFabric fabric;
+    DeclareRackRequest declare;
+    declare.authority.coordinator_epoch = fabric.coordinator_epoch();
+    declare.authority.rack = RackId{"rack-other"};
+    declare.epoch = RackEpochId{kRackEpoch};
+    RF_REQUIRE(fabric.declare_rack(declare).accepted());
+    RF_REQUIRE(fabric.save_state(state_path).status == PersistenceStatus::Ok);
+  }
+
+  Child coordinator;
+  coordinator.prepare(directory, "mismatch");
+  const std::string arguments = "--rack " + std::string(kRack) + " --rack-epoch " +
+                                std::string(kRackEpoch) + " --port 0 --stop-file \"" +
+                                coordinator.stop_path + "\" --state \"" + state_path + "\"";
+  RF_REQUIRE(launch(coordinator,
+                    executable_path("RACK_FABRIC_COORDINATOR", "rack_fabric_coordinator.exe"),
+                    arguments, directory));
+  const bool listening = wait_for_output(coordinator, "listening port=");
+  RF_CHECK(!listening);
+  if (listening) {
+    coordinator.request_stop();
+    (void)coordinator.wait_for_exit();
+  } else {
+    RF_CHECK_NE(coordinator.wait_for_exit(), static_cast<DWORD>(0));
+    RF_CHECK(coordinator.output().find("recovered state describes rack rack-other") !=
+             std::string::npos);
+  }
+  coordinator.release();
+  remove_directory(directory);
+}
